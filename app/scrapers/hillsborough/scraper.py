@@ -1,95 +1,261 @@
 import requests
 import time
+import re
 from datetime import datetime, timedelta
 
 BASE_URL = "https://gis.hcpafl.org/CommonServices/property"
 
 
-def fetch_sales(page=1, pagesize=500, days_back=7):
-    """Fetch sales from SalesSearchMod endpoint within a date range."""
-    url = f"{BASE_URL}/search/SalesSearchMod"
+# ----------------------------------------------------------
+# ADDRESS NORMALIZATION (PRESERVE SPACES, REMOVE PUNCT)
+# ----------------------------------------------------------
+def normalize_address(addr):
+    if not addr:
+        return ""
+    addr = addr.upper()
+    addr = re.sub(r"[,.]", "", addr)       # remove punctuation
+    addr = re.sub(r"\s+", " ", addr)       # collapse spaces
+    return addr.strip()
 
-    # SalesSearchMod does not support date filters directly.
-    # We will filter dates AFTER fetching.
+
+# ----------------------------------------------------------
+# Extract street number + street name only
+# ----------------------------------------------------------
+def extract_street_only(addr):
+    if not addr:
+        return ""
+
+    addr = addr.upper()
+
+    # Split by comma if present
+    if "," in addr:
+        return addr.split(",")[0].strip()
+
+    tokens = addr.split()
+
+    STOP_WORDS = {
+        "TAMPA", "ODESSA", "LUTZ", "APOLLO", "BEACH",
+        "PLANT", "RIVERVIEW", "FL", "GA", "TX", "NC",
+        "SC", "AL", "LA", "MS", "TN"
+    }
+
+    street_tokens = []
+    for tok in tokens:
+        if tok in STOP_WORDS:
+            break
+        street_tokens.append(tok)
+
+    return " ".join(street_tokens).strip()
+
+
+# ----------------------------------------------------------
+# OWNER-OCCUPIED DETECTION
+# ----------------------------------------------------------
+def is_owner_occupied(site_address, mailing_raw, buyer_name):
+
+    site_street = normalize_address(extract_street_only(site_address))
+    mail_street = normalize_address(extract_street_only(mailing_raw))
+
+    # If streets don't match → not owner occupied
+    if site_street != mail_street:
+        return False
+
+    # If buyer is an entity, it's investment even if addresses match
+    ENTITIES = ["LLC", "INC", "HOLDINGS", "CAPITAL", "PROPERTIES", "MGMT", "LP", "CORP"]
+    buyer_upper = (buyer_name or "").upper()
+
+    if any(word in buyer_upper for word in ENTITIES):
+        return False
+
+    return True  # Same street, and not business → owner occupied
+
+
+# ----------------------------------------------------------
+# Fetch single page of sales
+# ----------------------------------------------------------
+def fetch_sales(page=1, pagesize=1000):
+    url = f"{BASE_URL}/search/SalesSearchMod"
     params = {
         "prop": "0403,0400,0500,0501,0200,0408,0508,0111,0102,0100,0106",
         "stype": "q",
         "pagesize": pagesize,
-        "page": page
+        "page": page,
     }
-
     resp = requests.get(url, params=params)
     resp.raise_for_status()
-    sales = resp.json()
-
-    # Filter by date range manually
-    cutoff = datetime.now() - timedelta(days=days_back)
-    filtered = []
-
-    for r in sales:
-        try:
-            sale_date = datetime.strptime(r.get("saleDate"), "%Y-%m-%d")
-        except:
-            continue
-
-        if sale_date >= cutoff:
-            filtered.append(r)
-
-    return filtered
-
-
-def fetch_property_details(pin):
-    """Fetch buyer and mailing address from ParcelData endpoint."""
-    url = f"{BASE_URL}/search/ParcelData?pin={pin}"
-
-    resp = requests.get(url)
-    resp.raise_for_status()
-
     return resp.json()
 
 
-def get_recent_cash_buyers(max_pages=1, days_back=7):
-    """Main scraper function to assemble Tampa buyer list."""
-    all_buyers = []
+# ----------------------------------------------------------
+# Fetch full property details
+# ----------------------------------------------------------
+def fetch_property_details(pin):
+    url = f"{BASE_URL}/search/ParcelData?pin={pin}"
+    resp = requests.get(url)
+    resp.raise_for_status()
+    return resp.json()
 
-    for page in range(1, max_pages + 1):
+
+# ----------------------------------------------------------
+# Detect cash buyers
+# ----------------------------------------------------------
+def detect_cash_purchase(details):
+    sales = details.get("salesHistory", [])
+    if not sales:
+        return False
+
+    deed = (sales[0].get("deedType") or "").strip().upper()
+
+    investor_deed_types = ["TR", "TD", "QC", "SWD", "WD"]
+
+    if deed in investor_deed_types:
+        return True
+
+    # If NO mortgage data anywhere, assume cash
+    if "mortgage" not in str(details).lower():
+        return True
+
+    return False
+
+
+# ----------------------------------------------------------
+# MAIN INVESTOR SCRAPER
+# ----------------------------------------------------------
+def get_recent_cash_buyers(max_pages=None, days_back=180):
+
+    portfolio_map = {}
+    properties_by_mailing = {}
+
+    print(f"🔍 Building portfolio index for last {days_back} days...")
+
+    # ----------------------------------------------------------
+    # FIRST PASS — Build investor portfolios
+    # ----------------------------------------------------------
+    page = 1
+    while max_pages is None or page <= max_pages:
         print(f"📄 Fetching sales page {page}...")
-        sales = fetch_sales(page=page, days_back=days_back)
-
-        if not sales:
-            print("No more sales within date range.")
+        try:
+            sales = fetch_sales(page)
+        except:
             break
 
-        for sale in sales:
-            pin = sale.get("pin")
+        if not sales:
+            print(f"⚠️ No more sales at page {page}.")
+            break
+
+        for s in sales:
+
+            sale_date = s.get("saleDate")
+            if not sale_date:
+                continue
+
+            # Convert date
+            try:
+                sale_dt = datetime.strptime(sale_date, "%Y-%m-%d")
+            except:
+                continue
+
+            if sale_dt < datetime.now() - timedelta(days_back):
+                continue
+
+            pin = s.get("pin")
             if not pin:
                 continue
 
-            sale_price = sale.get("salePrice")
-            sale_date = sale.get("saleDate")
-            address = sale.get("address")
-            folio = sale.get("displayFolio")
+            try:
+                details = fetch_property_details(pin)
+            except Exception as e:
+                print("⚠️ Error fetching details:", e)
+                continue
 
-            # Fetch buyer details
-            details = fetch_property_details(pin)
+            # Mailing address
+            mailing = details.get("mailingAddress") or {}
+            mail_raw = f"{mailing.get('addr1','')} {mailing.get('city','')} {mailing.get('state','')} {mailing.get('zip','')}"
+            mail_norm = normalize_address(mail_raw)
 
-            buyer_name = details.get("owner")
-            mailing = details.get("mailingAddress", {})
+            # Extract property info
+            bldg = (details.get("buildings") or [{}])[0]
+            prop_type = bldg.get("type", {}).get("description", "")
+            year_built = bldg.get("yearBuilt")
 
-            mailing_full = f"{mailing.get('addr1', '')} {mailing.get('addr2', '')}, {mailing.get('city', '')} {mailing.get('state', '')} {mailing.get('zip', '')}"
+            site_addr = (
+                details.get("siteAddress")
+                or s.get("address")
+                or s.get("siteAddress")
+                or ""
+            )
 
-            result = {
-                "buyer_name": buyer_name,
-                "mailing_address": mailing_full.strip().replace("  ", " "),
-                "site_address": details.get("siteAddress"),
-                "sale_price": sale_price,
-                "sale_date": sale_date,
-                "folio": folio,
-                "pin": pin
+            prop_record = {
+                "pin": pin,
+                "folio": s.get("displayFolio"),
+                "site_address": site_addr,
+                "sale_price": s.get("salePrice"),
+                "sale_date": s.get("saleDate"),
+                "type": prop_type,
+                "year_built": year_built,
             }
 
-            all_buyers.append(result)
+            # Add to portfolio map
+            portfolio_map[mail_norm] = portfolio_map.get(mail_norm, 0) + 1
 
-            time.sleep(0.2)  # polite scraping delay
+            # Store all properties for this mailing address
+            if mail_norm not in properties_by_mailing:
+                properties_by_mailing[mail_norm] = []
 
-    return all_buyers
+            properties_by_mailing[mail_norm].append(prop_record)
+
+        page += 1
+        time.sleep(0.25)  # reduce risk of rate limiting
+
+    print(f"📦 Portfolio map built. Unique owners: {len(portfolio_map)}")
+
+    # ----------------------------------------------------------
+    # SECOND PASS — Apply investor filters
+    # ----------------------------------------------------------
+    investors = []
+
+    print("🔍 Applying investor filters...")
+
+    for mail_norm, props in properties_by_mailing.items():
+
+        if mail_norm not in portfolio_map:
+            continue
+
+        portfolio_count = portfolio_map[mail_norm]
+        if portfolio_count < 2:
+            continue  # skip one-off buyers
+
+        # Extract fields from first property (just to get owner + mailing)
+        sample_pin = props[0]["pin"]
+
+        try:
+            details = fetch_property_details(sample_pin)
+        except:
+            continue
+
+        buyer_name = details.get("owner", "").strip()
+
+        mailing = details.get("mailingAddress") or {}
+        mail_raw = f"{mailing.get('addr1','')} {mailing.get('city','')} {mailing.get('state','')} {mailing.get('zip','')}"
+
+        site_first = props[0].get("site_address", "")
+
+        # Filter out owner-occupied
+        if is_owner_occupied(site_first, mail_raw, buyer_name):
+            continue
+
+        # Cash buyer check
+        if not detect_cash_purchase(details):
+            continue
+
+        # Build final investor profile
+        investors.append({
+            "buyer_name": buyer_name,
+            "mailing_address": mail_raw.strip(),
+            "portfolio_count": portfolio_count,
+            "properties": props  # This is a LIST of all properties
+        })
+
+
+    print(f"🎉 FINAL INVESTOR COUNT: {len(investors)}")
+    return investors
